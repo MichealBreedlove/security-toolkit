@@ -1,0 +1,92 @@
+name: Network Audit
+
+# Scheduled weekly network audit — runs every Monday at 06:00 UTC.
+# Also supports manual dispatch so it can be triggered on demand
+# (e.g., after a firewall rule change or new VM deployment).
+
+on:
+  schedule:
+    # Every Monday at 06:00 UTC
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      inventory:
+        description: "Inventory file path (relative to repo root)"
+        required: false
+        default: "docs/services.yaml"
+
+permissions:
+  contents: read
+
+jobs:
+  network-audit:
+    name: Audit Network Posture
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y nmap netcat-openbsd python3-yaml
+
+      - name: Make script executable
+        run: chmod +x scripts/network_audit.sh
+
+      - name: Run network audit
+        id: audit
+        env:
+          # Set OPNSENSE_HOST, OPNSENSE_KEY, OPNSENSE_SECRET as repo secrets
+          # to enable OPNsense rule export/diff during the scheduled run.
+          OPNSENSE_HOST: ${{ secrets.OPNSENSE_HOST }}
+          OPNSENSE_KEY: ${{ secrets.OPNSENSE_KEY }}
+          OPNSENSE_SECRET: ${{ secrets.OPNSENSE_SECRET }}
+        run: |
+          INVENTORY="${{ github.event.inputs.inventory || 'docs/services.yaml' }}"
+
+          # Only run port audit if an inventory file exists
+          if [[ -f "$INVENTORY" ]]; then
+            ./scripts/network_audit.sh --inventory "$INVENTORY" --format json > audit-results.json || true
+          else
+            echo '{"status":"skipped","reason":"no inventory file found"}' > audit-results.json
+          fi
+
+          # OPNsense rule export (only if credentials are configured)
+          if [[ -n "$OPNSENSE_HOST" && -n "$OPNSENSE_KEY" && -n "$OPNSENSE_SECRET" ]]; then
+            RULES_FILE="opnsense-rules-$(date +%Y%m%d).json"
+            ./scripts/network_audit.sh \
+              --opnsense-host "$OPNSENSE_HOST" \
+              --opnsense-key "$OPNSENSE_KEY" \
+              --opnsense-secret "$OPNSENSE_SECRET" \
+              --export-rules "$RULES_FILE" || true
+          fi
+
+      - name: Upload audit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: network-audit-${{ github.run_number }}
+          path: |
+            audit-results.json
+            opnsense-rules-*.json
+          retention-days: 90
+
+      - name: Summarize findings
+        if: always()
+        run: |
+          if [[ -f audit-results.json ]]; then
+            echo "=== Network Audit Results ==="
+            cat audit-results.json | python3 -c "
+          import sys, json
+          try:
+              d = json.load(sys.stdin)
+              print(f'Status:     {d.get(\"status\", \"unknown\")}')
+              print(f'Violations: {d.get(\"violation_count\", 0)}')
+              for v in d.get('violations', []):
+                  print(f'  ! {v}')
+          except Exception as e:
+              print(f'Could not parse results: {e}')
+          " || true
+          fi
